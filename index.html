@@ -246,12 +246,36 @@ button { cursor: pointer; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
-<style>body{margin:0}[hidden]{display:none!important}</style>
+<style>body{margin:0}[hidden]{display:none!important}
+.auth { min-height: 100vh; display: grid; place-items: center; padding-inline: 16px; padding-block: 32px; }
+.auth-card { width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 28px 24px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 14px; }
+.auth-card h1 { font-size: 30px; font-weight: 800; }
+.auth-card input { background: var(--surface-2); border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; width: 100%; }
+.auth-card input:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px var(--accent-soft); }
+.auth-card .btn { width: 100%; padding: 11px; }
+.linkbtn { border: 0; background: none; color: var(--accent); font-weight: 600; padding: 0; }
+.auth-msg { font-size: 13.5px; border-radius: 9px; padding: 9px 12px; background: var(--surface-2); }
+.auth-msg.err { background: var(--gold-soft); }
+.who { font-size: 12.5px; color: var(--muted); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.2/dist/umd/supabase.js"></script>
 </head>
 <body>
 
 
-<div class="wrap">
+<main class="auth" id="auth" hidden>
+  <form class="auth-card" id="auth-form" autocomplete="on">
+    <div><h1>Daybook</h1><div class="muted">Sign in to see your plans and progress.</div></div>
+    <label class="field"><span class="label">Email</span><input id="a-email" type="email" autocomplete="email" required></label>
+    <label class="field"><span class="label">Password</span><input id="a-pass" type="password" autocomplete="current-password" minlength="8" required></label>
+    <button class="btn" type="submit" id="a-submit">Sign in</button>
+    <div class="auth-msg" id="a-msg" hidden></div>
+    <div class="muted" style="font-size:13.5px"><span id="a-q">New here?</span> <button type="button" class="linkbtn" id="a-mode">Create an account</button></div>
+  </form>
+</main>
+
+<div class="wrap" id="app" hidden>
   <header class="top">
     <div class="brand"><h1>Daybook</h1><span class="date" id="today-label"></span></div>
     <div class="row">
@@ -259,6 +283,8 @@ button { cursor: pointer; }
       <button class="btn ghost small" id="export" type="button">Export backup</button>
       <label class="btn ghost small" for="import" style="cursor:pointer">Import backup</label>
       <input type="file" id="import" accept="application/json,.json" hidden>
+      <span class="who" id="who"></span>
+      <button class="btn ghost small" id="signout" type="button" hidden>Sign out</button>
     </div>
   </header>
   <div class="banner" id="banner" hidden></div>
@@ -508,10 +534,111 @@ button { cursor: pointer; }
     };
   }
 
-  function connect() {
-    backend = localBackend();
-    setStatus("local", "Saved on this device");
+  // ---------- cloud sync (Supabase) — used when config.js is filled in ----------
+  const CFG = window.DAYBOOK_CONFIG || {};
+  const cloudOn = !!(CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase);
+  const TABLE = "daybook_docs";
+  let sb = null, session = null;
+
+  function applyRow(path, data) {
+    if (path === "meta/state") state.meta = data;
+    else if (path.startsWith("days/")) state.days[path.slice(5)] = data;
+  }
+  function cloudBackend(userId) {
+    return {
+      set: async (path, data) => {
+        const { error } = await sb.from(TABLE).upsert({ user_id: userId, path, data, updated_at: new Date().toISOString() }, { onConflict: "user_id,path" });
+        if (error) throw { code: navigator.onLine ? "error" : "unavailable", message: error.message };
+      },
+    };
+  }
+  async function loadCloud(reset) {
+    const rows = [];
+    for (let from = 0; ; from += 1000) {
+      const { data, error } = await sb.from(TABLE).select("path,data").order("path").range(from, from + 999);
+      if (error) { setStatus("local", "Couldn't load your data. Refresh to try again"); return false; }
+      rows.push(...data);
+      if (data.length < 1000) break;
+    }
+    if (reset) { state.days = {}; state.meta = null; }
+    rows.forEach(r => { if (!busy(r.path)) applyRow(r.path, r.data); });
+    return rows.length;
+  }
+  async function startCloud(sess) {
+    session = sess;
+    $("auth").hidden = true; $("app").hidden = false;
+    $("signout").hidden = false; $("who").textContent = sess.user.email || "";
+    setStatus("wait", "Loading…");
+    backend = cloudBackend(sess.user.id);
     renderAll();
+    const n = await loadCloud(true);
+    if (n === false) return;
+    // first sign-in: move anything saved in this browser into the account
+    let local = null; try { local = JSON.parse(localStorage.getItem(LS_KEY) || "null"); } catch (e) {}
+    if (n === 0 && local && Object.keys(local.days || {}).length) {
+      state.days = local.days || {}; state.meta = local.meta || null;
+      Object.keys(state.days).forEach(k => persist("days/" + k));
+      if (state.meta) persist("meta/state");
+      toast("Moved this browser's data into your account");
+    }
+    state.loaded = true; setStatus("synced", "Synced"); renderAll();
+    sb.channel("daybook-" + sess.user.id)
+      .on("postgres_changes", { event: "*", schema: "public", table: TABLE, filter: "user_id=eq." + sess.user.id }, (p) => {
+        const row = p.new && p.new.path ? p.new : null;
+        if (row && !busy(row.path)) { applyRow(row.path, row.data); renderAll(); }
+      })
+      .subscribe();
+  }
+
+  let signUpMode = false;
+  function authMsg(text, err) { const m = $("a-msg"); m.hidden = !text; m.textContent = text || ""; m.className = "auth-msg" + (err ? " err" : ""); }
+  function setAuthMode(up) {
+    signUpMode = up;
+    $("a-submit").textContent = up ? "Create account" : "Sign in";
+    $("a-q").textContent = up ? "Already have an account?" : "New here?";
+    $("a-mode").textContent = up ? "Sign in" : "Create an account";
+    $("a-pass").autocomplete = up ? "new-password" : "current-password";
+    authMsg("");
+  }
+  $("a-mode").onclick = () => setAuthMode(!signUpMode);
+  $("auth-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = $("a-email").value.trim(), password = $("a-pass").value;
+    $("a-submit").disabled = true; authMsg(signUpMode ? "Creating your account…" : "Signing in…");
+    try {
+      if (signUpMode) {
+        const { data, error } = await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } });
+        if (error) throw error;
+        if (!data.session) { setAuthMode(false); authMsg("Check your email and click the confirmation link, then sign in here."); }
+      } else {
+        const { error } = await sb.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (err) {
+      authMsg(/invalid login/i.test(err.message) ? "That email and password don't match. Try again or create an account." : err.message, true);
+    } finally { $("a-submit").disabled = false; }
+  });
+  $("signout").onclick = async () => { await sb.auth.signOut(); location.reload(); };
+
+  async function connect() {
+    if (!cloudOn) {
+      $("app").hidden = false;
+      backend = localBackend();
+      setStatus("local", "Saved on this device");
+      renderAll();
+      return;
+    }
+    sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey);
+    sb.auth.onAuthStateChange((event, sess) => {
+      if (sess && !session) setTimeout(() => startCloud(sess), 0);
+      if (event === "SIGNED_OUT" && session) location.reload();
+    });
+    const { data } = await sb.auth.getSession();
+    if (data.session) { if (!session) startCloud(data.session); }
+    else { $("auth").hidden = false; $("a-email").focus(); }
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState === "visible" && session && state.loaded && (await loadCloud(false)) !== false) renderAll();
+    });
   }
   function setStatus(s, text) { const el = $("status"); el.dataset.s = s; el.textContent = text; }
 
@@ -919,7 +1046,8 @@ button { cursor: pointer; }
       const data = JSON.parse(await f.text());
       if (!data || typeof data.days !== "object") throw new Error("bad");
       state.days = data.days || {}; state.meta = data.meta || null;
-      await backend.set(); renderAll();
+      Object.keys(state.days).forEach(k => persist("days/" + k));
+      persist("meta/state"); renderAll();
       toast(`Restored ${Object.keys(state.days).length} days from backup`);
     } catch (err) { toast("That file isn't a Daybook backup. Pick a file made with Export backup."); }
   });
